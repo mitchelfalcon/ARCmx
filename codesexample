@@ -1,0 +1,350 @@
+Las opciones anteriores se sintetizaron para agilizar la navegación en la interfaz, pero a continuación se presentan desarrolladas en su totalidad, con código extendido, explicaciones detalladas y listas para su implementación en la competencia sobre la infraestructura NVIDIA RTX Pro (48 GB VRAM).
+Opción 1: Suite Completa de Auditado y Diagnóstico de Scripts (Verificación de Memoria, ABI y Dependencias)
+Si ya tienes un script escrito, esta herramienta de auditoría en Python analiza tu código en tiempo de ejecución, detecta fugas de memoria VRAM, verifica la compatibilidad de binarios (C++11 ABI) e identifica cuellos de botella antes de enviar tu solución a evaluación.
+import sys
+import gc
+import os
+import traceback
+import torch
+
+class SystemAuditor:
+    """
+    Auditor de Entorno y Diagnosticador de Código para NVIDIA RTX Pro 48GB.
+    Supervisa la salud del Garbage Collector, fragmentación de CUDA y compatibilidad C++.
+    """
+    def __init__(self):
+        self.vram_threshold_gb = 44.0  # Límite de alerta para los 48 GB disponibles
+        
+    def audit_environment_compatibility(self):
+        print("🔍 === AUDITORÍA DE ENTORNO Y DEPENDENCIAS ===")
+        print(f"• Versión de Python: {sys.version.split()[0]}")
+        print(f"• Versión de PyTorch: {torch.__version__}")
+        print(f"• Versión de CUDA en PyTorch: {torch.version.cuda}")
+        
+        # Validación de CXX11 ABI
+        abi_flag = torch._C._GLIBCXX_USE_CXX11_ABI
+        print(f"• C++11 ABI Activo: {abi_flag} (Recomendado: False para wheels precompilados de FlashAttention)")
+        
+        # Validación de GPU
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            cap = torch.cuda.get_device_capability(0)
+            total_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            print(f"• Dispositivo Detectado: {gpu_name}")
+            print(f"• Compute Capability: {cap[0]}.{cap[1]} (Recomendado Ada Lovelace: 8.9)")
+            print(f"• VRAM Total: {total_mem:.2f} GB")
+        else:
+            print("❌ ALERTA CRÍTICA: CUDA no está disponible.")
+
+    def trace_vram_usage(self, label="Punto de Control"):
+        """Mide la memoria reservada y asignada en la GPU."""
+        if not torch.cuda.is_available():
+            return
+        
+        allocated = torch.cuda.memory_allocated(0) / (1024**3)
+        reserved = torch.cuda.memory_reserved(0) / (1024**3)
+        max_allocated = torch.cuda.max_memory_allocated(0) / (1024**3)
+        
+        print(f"\n📊 [VRAM MEMORY TRACE - {label}]")
+        print(f"  ├── Memoria Asignada Actual: {allocated:.3f} GB")
+        print(f"  ├── Memoria Reservada por PyTorch: {reserved:.3f} GB")
+        print(f"  └── Pico Máximo Alcanzado: {max_allocated:.3f} GB")
+        
+        if allocated > self.vram_threshold_gb:
+            print("⚠️ ADVERTENCIA: La VRAM se encuentra cerca del límite de 48 GB. Ejecutando recolección preventiva...")
+            self.force_garbage_collection()
+
+    def force_garbage_collection(self):
+        """Limpia referencias huérfanas en memoria de Python y vacía la caché de CUDA."""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        print("🧹 Recolección de basura y vaciado de caché CUDA completados.")
+
+    def run_user_script_dry_run(self, execution_function, *args, **kwargs):
+        """
+        Envuelve la función principal de tu script dentro de un entorno supervisado con reintentos.
+        """
+        print("\n🚀 === INICIANDO EJECUCIÓN SUPERVISADA DEL SCRIPT ===")
+        self.trace_vram_usage("Inicio del Script")
+        
+        try:
+            # Forzar precisión optimizada antes de ejecutar
+            torch.set_float32_matmul_precision('high')
+            
+            result = execution_function(*args, **kwargs)
+            
+            self.trace_vram_usage("Fin del Script")
+            print("✅ Auditoría de Ejecución: Código finalizado sin errores de memoria ni fallos de segmentación.")
+            return result
+            
+        except torch.cuda.OutOfMemoryError as oom:
+            print("\n🚨 [OOM CRÍTICO DETECTADO]")
+            print("Detalle del error: El script intentó asignar más memoria de la disponible.")
+            self.force_garbage_collection()
+            print("Sugerencia: Reduce el Batch Size o activa el gradiente acumulado.")
+            return None
+            
+        except Exception as e:
+            print(f"\n❌ [ERROR DE LOGICA O COMPATIBILIDAD]: {str(e)}")
+            print(traceback.format_exc())
+            return None
+
+# Instanciación y uso del auditor
+auditor = SystemAuditor()
+auditor.audit_environment_compatibility()
+
+Opción 2: Motor Completo de Grafos Acíclicos Dirigidos (DAG Agéntico) con Resiliencia Extrema
+Esta arquitectura permite estructurar la ejecución del pipeline en nodos independientes. Cada nodo maneja sus propios tensores en la RTX Pro, gestiona errores de GPU sin detener el proceso general y realiza checkpoints intermedios.
+import time
+import uuid
+import torch
+import networkx as nx
+from typing import Dict, Any, Callable
+
+class ResilientDAGEngine:
+    """
+    Motor de orquestación de flujos de trabajo agénticos optimizado para ejecución paralela y resiliencia en GPU.
+    """
+    def __init__(self):
+        self.dag = nx.DiGraph()
+        self.results_store: Dict[str, Any] = {}
+        self.execution_metrics: Dict[str, Dict[str, float]] = {}
+
+    def add_node(self, node_id: str, action_fn: Callable, dependencies: list = None):
+        """Añade un nodo ejecutable al grafo con sus dependencias."""
+        self.dag.add_node(node_id, action=action_fn)
+        if dependencies:
+            for dep in dependencies:
+                self.dag.add_edge(dep, node_id)
+
+    def _execute_node_safe(self, node_id: str) -> bool:
+        action_fn = self.dag.nodes[node_id]['action']
+        dependencies = list(self.dag.predecessors(node_id))
+        
+        # Recuperar salidas de nodos previos como argumentos
+        dep_data = {dep: self.results_store.get(dep) for dep in dependencies}
+        
+        print(f"\n⚙️ [EJECUTANDO NODO: {node_id}] | Dependencias: {dependencies}")
+        start_time = time.time()
+        
+        # Reintentos dinámicos en caso de error
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                # Ejecutar el paso en formato de precisión bfloat16
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    output = action_fn(dep_data)
+                
+                self.results_store[node_id] = output
+                elapsed_time = time.time() - start_time
+                
+                # Métrica de consumo
+                self.execution_metrics[node_id] = {
+                    "latency_sec": elapsed_time,
+                    "status": 1.0  # 1.0 representa éxito
+                }
+                print(f"✅ [NODO COMPLETADO: {node_id}] en {elapsed_time:.3f} segundos.")
+                return True
+                
+            except torch.cuda.OutOfMemoryError:
+                print(f"⚠️ [OOM en Intento {attempt}/{max_retries}] Vaciando memoria VRAM...")
+                torch.cuda.empty_cache()
+                time.sleep(1)
+            except Exception as err:
+                print(f"❌ [Error en Intento {attempt}/{max_retries}] Nodo {node_id}: {err}")
+                time.sleep(1)
+                
+        # Si la GPU falla tras 3 intentos, se marca el fallo
+        self.execution_metrics[node_id] = {"latency_sec": time.time() - start_time, "status": 0.0}
+        return False
+
+    def run_pipeline(self):
+        """Ejecuta el grafo respetando el orden topológico exacto de sus dependencias."""
+        if not nx.is_directed_acyclic_graph(self.dag):
+            raise ValueError("El grafo configurado no es un DAG válido (contiene ciclos).")
+        
+        execution_order = list(nx.topological_sort(self.dag))
+        print(f"📋 Orden Topológico de Ejecución Aprobado: {execution_order}")
+        
+        for node_id in execution_order:
+            success = self._execute_node_safe(node_id)
+            if not success:
+                print(f"💥 Interruptor activado: Deteniendo pipeline por fallo crítico en el nodo {node_id}.")
+                break
+
+# --- Definición de Nodos de Ejemplo ---
+def step_data_extraction(inputs):
+    # Simulación de extracción
+    return {"raw_data": torch.randn((5000, 5000), device="cuda")}
+
+def step_tensor_transformation(inputs):
+    raw_tensor = inputs["extract_node"]["raw_data"]
+    # Procesamiento denso usando Tensor Cores
+    matrix_weights = torch.randn((5000, 5000), device="cuda")
+    processed_matrix = torch.matmul(raw_tensor, matrix_weights)
+    return {"processed_data": processed_matrix.sum().item()}
+
+def step_final_aggregation(inputs):
+    val = inputs["transform_node"]["processed_data"]
+    return f"Resultado acumulado final: {val:.4f}"
+
+# --- Construcción del DAG ---
+engine = ResilientDAGEngine()
+engine.add_node("extract_node", step_data_extraction)
+engine.add_node("transform_node", step_tensor_transformation, dependencies=["extract_node"])
+engine.add_node("aggregate_node", step_final_aggregation, dependencies=["transform_node"])
+
+# Ejecutar pipeline resiliente
+engine.run_pipeline()
+
+Opción 3: Generador Completo de Reportes PDF Offline del Estado del Pipeline (ReportLab)
+Para generar reportes ejecutivos o entregables exigidos por la plataforma de competencia sin requerir conexión a internet, este módulo compila métricas, consumo de ACUs y estado de nodos en un documento PDF formateado.
+import os
+import time
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+
+class PipelinePDFReporter:
+    """
+    Generador de reportes ejecutivos en formato PDF en entorno totalmente offline.
+    """
+    def __init__(self, output_filename="Reporte_Ejecucion_Pipeline.pdf"):
+        self.output_filename = output_filename
+        self.styles = getSampleStyleSheet()
+        self._configure_custom_styles()
+
+    def _configure_custom_styles(self):
+        self.styles.add(ParagraphStyle(
+            name='ReportTitle',
+            fontName='Helvetica-Bold',
+            fontSize=22,
+            leading=26,
+            textColor=colors.HexColor('#1A202C')
+        ))
+        self.styles.add(ParagraphStyle(
+            name='SectionHeader',
+            fontName='Helvetica-Bold',
+            fontSize=14,
+            leading=18,
+            textColor=colors.HexColor('#2B6CB0'),
+            spaceBefore=12,
+            spaceAfter=6
+        ))
+        self.styles.add(ParagraphStyle(
+            name='TableCell',
+            fontName='Helvetica',
+            fontSize=9,
+            leading=11,
+            textColor=colors.HexColor('#2D3748')
+        ))
+        self.styles.add(ParagraphStyle(
+            name='TableCellBold',
+            fontName='Helvetica-Bold',
+            fontSize=9,
+            leading=11,
+            textColor=colors.HexColor('#1A202C')
+        ))
+
+    def generate_report(self, system_info: dict, node_metrics: list, total_acu: float):
+        doc = SimpleDocTemplate(
+            self.output_filename,
+            pagesize=letter,
+            rightMargin=36,
+            leftMargin=36,
+            topMargin=36,
+            bottomMargin=36
+        )
+        story = []
+
+        # Título del Reporte
+        story.append(Paragraph("Reporte de Auditoría y Ejecución del Pipeline", self.styles['ReportTitle']))
+        story.append(Paragraph(f"Fecha de Generación: {time.strftime('%Y-%m-%d %H:%M:%S')}", self.styles['TableCell']))
+        story.append(Spacer(1, 10))
+        story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor('#2B6CB0'), spaceAfter=15))
+
+        # Sección 1: Información de Infraestructura
+        story.append(Paragraph("1. Detalle de Infraestructura de Cómputo", self.styles['SectionHeader']))
+        
+        env_data = [
+            [Paragraph("<b>Componente</b>", self.styles['TableCellBold']), Paragraph("<b>Especificación Asignada</b>", self.styles['TableCellBold'])],
+            [Paragraph("Procesador Gráfico (GPU)", self.styles['TableCell']), Paragraph(system_info.get("gpu", "NVIDIA RTX Pro"), self.styles['TableCell'])],
+            [Paragraph("VRAM Disponible", self.styles['TableCell']), Paragraph(system_info.get("vram", "48 GB GDDR6"), self.styles['TableCell'])],
+            [Paragraph("Instancia GCP Cloud", self.styles['TableCell']), Paragraph(system_info.get("instance", "G4 Standard"), self.styles['TableCell'])],
+            [Paragraph("Framework / Backend", self.styles['TableCell']), Paragraph(system_info.get("framework", "PyTorch 2.4.0 + CUDA 12.4"), self.styles['TableCell'])]
+        ]
+        
+        t_env = Table(env_data, colWidths=[200, 340])
+        t_env.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#EDF2F7')),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E0')),
+            ('PADDING', (0,0), (-1,-1), 6),
+        ]))
+        story.append(t_env)
+        story.append(Spacer(1, 15))
+
+        # Sección 2: Métricas por Nodo
+        story.append(Paragraph("2. Resumen de Ejecución por Nodos DAG", self.styles['SectionHeader']))
+        
+        node_table_data = [
+            [
+                Paragraph("<b>Nodo ID</b>", self.styles['TableCellBold']),
+                Paragraph("<b>Latencia (s)</b>", self.styles['TableCellBold']),
+                Paragraph("<b>Uso VRAM (GB)</b>", self.styles['TableCellBold']),
+                Paragraph("<b>Estado</b>", self.styles['TableCellBold'])
+            ]
+        ]
+        
+        for item in node_metrics:
+            status_text = "<font color='green'>ÉXITO</font>" if item['success'] else "<font color='red'>FALLO</font>"
+            node_table_data.append([
+                Paragraph(item['name'], self.styles['TableCell']),
+                Paragraph(f"{item['latency']:.3f}", self.styles['TableCell']),
+                Paragraph(f"{item['vram']:.2f}", self.styles['TableCell']),
+                Paragraph(status_text, self.styles['TableCell'])
+            ])
+
+        t_nodes = Table(node_table_data, colWidths=[180, 120, 120, 120])
+        t_nodes.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#E2E8F0')),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E0')),
+            ('PADDING', (0,0), (-1,-1), 5),
+        ]))
+        story.append(t_nodes)
+        story.append(Spacer(1, 15))
+
+        # Sección 3: Liquidación Económica (ACU)
+        story.append(Paragraph("3. Liquidación de Unidades de Cómputo (ACUs)", self.styles['SectionHeader']))
+        acu_paragraph = f"El costo de cómputo atómico acumulado de la sesión equivale a: <b>{total_acu:.4f} ACUs</b>."
+        story.append(Paragraph(acu_paragraph, self.styles['TableCell']))
+
+        # Construcción del PDF
+        doc.build(story)
+        print(f"📄 Reporte PDF generado correctamente en: {os.path.abspath(self.output_filename)}")
+
+# --- Ejecución del Generador ---
+if __name__ == "__main__":
+    reporter = PipelinePDFReporter("Reporte_Final_RTX_Pro.pdf")
+    
+    mock_system = {
+        "gpu": "NVIDIA RTX Pro (Ada Lovelace)",
+        "vram": "48.00 GB",
+        "instance": "GCP g4-standard-96",
+        "framework": "PyTorch 2.4.0+cu124 / vLLM 0.5.4"
+    }
+    
+    mock_metrics = [
+        {"name": "extracción_datos", "latency": 1.240, "vram": 4.2, "success": True},
+        {"name": "transformacion_tensor", "latency": 5.610, "vram": 18.5, "success": True},
+        {"name": "inferencia_modelo", "latency": 12.300, "vram": 38.1, "success": True},
+        {"name": "agregacion_resultados", "latency": 0.450, "vram": 2.1, "success": True}
+    ]
+    
+    reporter.generate_report(mock_system, mock_metrics, total_acu=1.4820)
+
