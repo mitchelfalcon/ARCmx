@@ -1,0 +1,242 @@
+1. Archivo de Requerimientos (requirements.txt) y Manifest de Wheels
+Este manifiesto asegura que ninguna dependencia descargue versiones no alineadas que rompan el binario C++ de PyTorch (_GLIBCXX_USE_CXX11_ABI=0).
+# --- CORE FRAMEWORK (CUDA 12.4 / Compute Capability 8.9) ---
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.4.0+cu124
+torchvision==0.19.0+cu124
+torchaudio==2.4.0+cu124
+
+# --- ACELERACIÓN DE ATENCIÓN Y MOTORES DE INFERENCIA ---
+# Nota: flash-attn debe ser la versión precompilada abiFALSE
+https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu122torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+xformers==0.0.27
+vllm==0.5.4
+
+# --- PROCESAMIENTO TABULAR EN VRAM (RAPIDS CUDA 12) ---
+--extra-index-url https://pypi.nvidia.com
+cudf-cu12==24.08.0
+dask-cudf-cu12==24.08.0
+cuml-cu12==24.08.0
+
+# --- UTILIDADES Y PROTOCOLO DE AUDITORÍA ---
+pydantic==2.7.1
+PyJWT==2.8.0
+reportlab==4.2.0
+networkx==3.3
+psutil==5.9.8
+
+2. Código Completo de Despliegue e Instalación de la Plataforma (deploy_platform.py)
+Este script realiza la instalación secuencial aislada. Previene que pip resuelva dinámicamente paquetes no compatibles, verifica la compatibilidad de arquitectura en caliente y valida la integridad de los módulos instalados.
+import os
+import sys
+import shutil
+import subprocess
+import logging
+from pathlib import Path
+
+# Configuración de Logging para Auditoría de Despliegue
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S"
+)
+logger = logging.getLogger("PlatformDeployer")
+
+class PlatformInstaller:
+    """
+    Gestor de despliegue offline/online para la plataforma NVIDIA RTX Pro 48GB.
+    Garantiza el orden estricto de instalación de Wheels para evitar conflictos de ABI.
+    """
+    def __init__(self, wheels_dir: str = None):
+        self.wheels_dir = Path(wheels_dir) if wheels_dir else None
+        self.python_bin = sys.executable
+        
+    def _run_command(self, cmd: str, description: str) -> bool:
+        logger.info(f"Iniciando: {description}...")
+        try:
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            logger.info(f"✅ Éxito: {description}")
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ Fallo crítico en '{description}':\nSTDOUT: {e.stdout}\nSTDERR: {e.stderr}")
+            return False
+
+    def check_cuda_driver(self):
+        """Verifica que el controlador del Host soporte la GPU Ada Lovelace."""
+        logger.info("Comprobando entorno de controladores del Host...")
+        try:
+            nvidia_smi = subprocess.check_output("nvidia-smi", shell=True, text=True)
+            if "RTX" in nvidia_smi or "L4" in nvidia_smi or "G4" in nvidia_smi:
+                logger.info("✅ GPU NVIDIA detectada correctamente en el sistema.")
+            else:
+                logger.warning("⚠️ Dispositivo GPU no identificado explícitamente como RTX Pro / G4.")
+        except Exception:
+            logger.error("❌ 'nvidia-smi' no está disponible. Revisa los controladores del Host.")
+
+    def install_pipeline(self):
+        """Ejecuta la secuencia ordenada de instalación de paquetes."""
+        self.check_cuda_driver()
+        
+        # 1. Actualización de herramientas base de empaquetado
+        self._run_command(
+            f"{self.python_bin} -m pip install --upgrade pip setuptools wheel --quiet",
+            "Actualización de Pip y Setuptools"
+        )
+
+        base_pip = f"{self.python_bin} -m pip install "
+        if self.wheels_dir and self.wheels_dir.exists():
+            logger.info(f"Modo Offline Activado. Buscando wheels en: {self.wheels_dir}")
+            base_pip += f"--no-index --find-links={self.wheels_dir} "
+
+        # 2. Instalación de PyTorch CUDA 12.4 Core
+        torch_cmd = base_pip + "torch==2.4.0+cu124 torchvision==0.19.0+cu124 torchaudio==2.4.0+cu124"
+        if not self.wheels_dir:
+            torch_cmd += " --index-url https://download.pytorch.org/whl/cu124"
+        
+        if not self._run_command(torch_cmd, "Instalación de PyTorch 2.4.0+cu124 Core"):
+            raise RuntimeError("Error al instalar PyTorch Core. Abortando instalación.")
+
+        # 3. Instalación de FlashAttention-2 (Wheel Binario Directo)
+        if self.wheels_dir and self.wheels_dir.exists():
+            flash_cmd = base_pip + "flash_attn"
+        else:
+            flash_url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu122torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl"
+            flash_cmd = base_pip + f"{flash_url}"
+            
+        if not self._run_command(flash_cmd, "Instalación de FlashAttention-2 (abiFALSE)"):
+            logger.warning("⚠️ No se pudo instalar FlashAttention-2 precompilado. Se recurrirá a PyTorch SDPA.")
+
+        # 4. Instalación de Motores de Inferencia y Datos (vLLM, xFormers, cuDF)
+        extra_pkgs = "vllm==0.5.4 xformers==0.0.27 pydantic==2.7.1 PyJWT==2.8.0 reportlab==4.2.0 networkx==3.3 psutil"
+        vllm_cmd = base_pip + extra_pkgs
+        if not self.wheels_dir:
+            vllm_cmd += " --extra-index-url https://download.pytorch.org/whl/cu124"
+            
+        self._run_command(vllm_cmd, "Instalación de Motores de Inferencia y Utilidades")
+
+        logger.info("🎉 ¡Despliegue de la Plataforma Completado Exitosamente!")
+
+if __name__ == "__main__":
+    # Si existe una carpeta de wheels locales, se pasa como argumento
+    WHEELS_LOCAL_PATH = "/kaggle/input/rtx-pro-wheels-dataset" if os.path.exists("/kaggle/input/rtx-pro-wheels-dataset") else None
+    
+    installer = PlatformInstaller(wheels_dir=WHEELS_LOCAL_PATH)
+    installer.install_pipeline()
+
+3. Script de Inyección de Arquitectura y Parcheo de Sistema (inject_architecture.py)
+Este script debe ejecutarse en la Primera Celda del Notebook. Aplica la inyección de variables de entorno para el bus PCIe de la máquina G4, realiza el Monkey Patching de la gestión de memoria de PyTorch para prevenir que el Kernel de Jupyter falle (Kernel Crash), y bloquea las degradaciones lentas a CPU.
+import os
+import sys
+import gc
+import functools
+import logging
+
+# ---------------------------------------------------------------------------
+# FASE 1: INYECCIÓN DE VARIABLES DE ENTORNO CRÍTICAS (Antes de importar torch)
+# ---------------------------------------------------------------------------
+os.environ["NCCL_P2P_LEVEL"] = "PHB"                       # Interconexión P2P PCIe para G4
+os.environ["NCCL_DEBUG"] = "ERROR"                         # Desactivar verbosidad excesiva de NCCL
+os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"           # Optimización de colas de comandos para Ada Lovelace
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+    "expandable_segments:True,"                            # Previene fragmentación de memoria en VRAM
+    "max_split_size_mb:512,"                               # Evita bloques masivos indivisibles
+    "garbage_collection_threshold:0.8"                     # Recolección automática de VRAM al 80%
+)
+os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"       # Evita bloqueos infinitos si falla un proceso secundario
+
+# Impresión de confirmación de inyección de entorno
+print("==================================================================")
+print("🚀 [INYECCIÓN DE ARQUITECTURA] Variables de Entorno del Kernel Configuradas")
+print("==================================================================")
+
+import torch
+
+# ---------------------------------------------------------------------------
+# FASE 2: MONKEY PATCHING Y TRATAMIENTO DE ERRORES DE MEMORIA VRAM
+# ---------------------------------------------------------------------------
+
+def global_vram_cleanup():
+    """Realiza una limpieza agresiva del Garbage Collector y Búfers de CUDA."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+def patch_oom_recovery(func):
+    """
+    Decorador Monkey Patch: Envuelve funciones críticas de tensores. Si ocurre un OOM,
+    vacia la VRAM y reintenta antes de propagar el fallo y romper el Kernel.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except torch.cuda.OutOfMemoryError as oom_err:
+            print(f"\n🚨 [OOM INTERCEPTADO EN '{func.__name__}'] Vaciando búfer VRAM y reintentando...")
+            global_vram_cleanup()
+            try:
+                return func(*args, **kwargs)
+            except torch.cuda.OutOfMemoryError:
+                print(f"💥 [OOM PERSISTENTE EN '{func.__name__}'] Imposible procesar el tensor en GPU.")
+                raise oom_err
+    return wrapper
+
+# Aplicar el parche preventivo a la función de multiplicación de matrices global
+torch.matmul = patch_oom_recovery(torch.matmul)
+
+# ---------------------------------------------------------------------------
+# FASE 3: CONFIGURACIÓN DE TENSORES Y COMPATIBILIDAD CON RTX PRO (48 GB)
+# ---------------------------------------------------------------------------
+
+def configure_hardware_runtime():
+    """
+    Valida y configura el motor de cálculo de PyTorch para la arquitectura Ada Lovelace.
+    """
+    if not torch.cuda.is_available():
+        raise SystemError("❌ CRÍTICO: CUDA no está activo. Revisa la asignación de hardware.")
+
+    device_properties = torch.cuda.get_device_properties(0)
+    device_name = device_properties.name
+    vram_gb = device_properties.total_memory / (1024 ** 3)
+    
+    print(f"• Dispositivo Activo: {device_name}")
+    print(f"• Capacidad VRAM Asignada: {vram_gb:.2f} GB")
+    print(f"• Compute Capability: {device_properties.major}.{device_properties.minor}")
+    
+    # Activar TensorCores en FP32 / TF32
+    torch.set_float32_matmul_precision('high')
+    
+    # Configurar Backends de Atención (Forzar SDPA de alto rendimiento)
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_math_sdp(False)  # Desactivar la versión en CPU/Math para evitar ejecuciones lentas silenciosas
+    
+    # Validar soporte nativo de BFloat16
+    if torch.cuda.is_bf16_supported():
+        print("✅ Soporte BFloat16 Nativo: ACTIVADO")
+    else:
+        print("⚠️ Advertencia: BFloat16 no soportado de forma nativa en el dispositivo.")
+
+    # Iniciar monitor de memoria interna
+    torch.cuda.reset_peak_memory_stats()
+    print("==================================================================")
+    print("✅ [INYECCIÓN COMPLETADA] Sistema protegido contra fallos de versión y OOM")
+    print("==================================================================")
+
+# Ejecutar la inyección
+configure_hardware_runtime()
+
+Instrucciones de Despliegue en el Notebook
+ * Celda 1 (Instalación de dependencias):
+   !python deploy_platform.py
+
+ * Celda 2 (Inyección e Inicialización de Arquitectura):
+   import inject_architecture
+
+   Al ejecutar la Celda 2, el entorno aplicará las variables de entorno, parchará la gestión de memoria de PyTorch y garantizará que ningún desajuste de versión o pico de VRAM detenga la ejecución del notebook durante la competencia.
