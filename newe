@@ -1,0 +1,351 @@
+import os
+import sys
+import ast
+import gc
+import re
+import tempfile
+import subprocess
+import warnings
+import resource
+import logging
+from collections import defaultdict
+from typing import Tuple, Dict, Any, List
+import pandas as pd
+import polars as pl
+
+# ==============================================================================
+# TIER 1: ENVIRONMENT ASSEMBLER & FAULT-TOLERANT DEPENDENCY LOADER
+# ==============================================================================
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["TRANSFORMERS_NO_TF"] = "1"
+os.environ["TRANSFORMERS_NO_FLAX"] = "1"
+os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda/bin/ptxas"
+os.environ["RAY_DEDUP_LOGS"] = "0"
+os.environ["PYDEVD_DISABLE_FILE_VALIDATION"] = "1"
+warnings.filterwarnings("ignore")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("AIMO_RTX6000_Assembler")
+
+class HybridTopologyAssembler:
+    @staticmethod
+    def verify_and_repair_environment() -> bool:
+        logger.info("--- [ENV] INITIALIZING FAULT-TOLERANT ENVIRONMENT VALIDATION FOR RTX 6000 ---")
+        wheels_paths = [
+            "/kaggle/input/rtx6000-wheels-v1",
+            "/kaggle/input/datasets/naileafalcon/aimo3-wheels-v2/aimo_wheels_v2",
+            "/kaggle/input/aimo3-wheels-v2"
+        ]
+        
+        target_wheels_dir = None
+        for path in wheels_paths:
+            if os.path.exists(path):
+                target_wheels_dir = path
+                break
+
+        if not target_wheels_dir:
+            logger.warning("[ENV] Offline wheel directory not found in known paths. Falling back to active site-packages.")
+            return HybridTopologyAssembler._verify_critical_packages()
+
+        logger.info(f"[ENV] Discovered offline wheel repository at: {target_wheels_dir}")
+        
+        # Purge conflicting layers gracefully
+        subprocess.run(
+            [sys.executable, "-m", "pip", "uninstall", "-y", "tensorflow", "matplotlib", "keras", "scikit-learn"],
+            capture_output=True, text=True
+        )
+
+        install_result = subprocess.run(
+            [
+                sys.executable, "-m", "pip", "install", 
+                "--no-index", "--find-links", target_wheels_dir,
+                "vllm", "transformers", "polars", "sympy", "protobuf==3.20.3"
+            ],
+            capture_output=True, text=True
+        )
+
+        if install_result.returncode == 0:
+            logger.info("[ENV] Offline air-gapped dependencies successfully verified and installed.")
+            return True
+        else:
+            logger.error(f"[ENV] Local wheel installation encountered issues: {install_result.stderr}")
+            return HybridTopologyAssembler._verify_critical_packages()
+
+    @staticmethod
+    def _verify_critical_packages() -> bool:
+        critical_modules = ["vllm", "transformers", "polars", "sympy", "google.protobuf"]
+        missing = []
+        for mod in critical_modules:
+            try:
+                __import__(mod)
+            except ImportError:
+                missing.append(mod)
+        
+        if missing:
+            logger.critical(f"[ENV] Critical packages missing and unrecoverable: {missing}")
+            return False
+        logger.info("[ENV] All critical packages verified via system fallback.")
+        return True
+
+# ==============================================================================
+# TIER 2: CORE ENGINE (RED TEAM AST, SECURITY & VLLM INFERENCE)
+# ==============================================================================
+IRONCLAD_SYSTEM_PROMPT = """
+### SYSTEM ROLE & OBJECTIVE
+You are an elite, autonomous Mathematical AI designed to win the AIMO Progress Prize 3 on NVIDIA RTX 6000 hardware. Your sole objective is to solve extremely complex, Olympiad-level mathematical problems and output a highly optimized, deterministic Python script that computes the exact final answer.
+
+### MANDATORY THINKING PHASES
+You must explicitly frame your internal reasoning using the following XML structures:
+1. <problem_space_mapping>: Deconstruct the problem axioms, identify traps, and state the target modular domain (modulo 100000).
+2. <theorem_retrieval>: Declare advanced mathematical theorems, invariants, or algebraic manipulations required.
+3. <divergent_exploration>: Outline 3 orthogonal algorithmic or algebraic trajectories.
+4. <adversarial_falsification>: Act as an internal Red Team to destroy naive brute-force loops or time-complexity violations.
+5. <convergent_synthesis>: Condense the optimal approach into a clean, highly secure Python script.
+
+### CODE EXECUTION CONSTRAINTS
+- NO massive brute-force loops. Use number theory or O(1) / O(log N) shortcuts.
+- Always use sympy for exact symbolic manipulations or Python native integers for modular arithmetic.
+- The final output of your code block MUST print the pure integer answer.
+
+### FINAL ANSWER FORMAT
+Your final output must conclude with the exact artifact:
+<final_artifact>
+```python
+print(final_answer)
+```
+\boxed{EXACT_INTEGER}
+</final_artifact>
+"""
+
+class RedTeamASTValidator(ast.NodeVisitor):
+    def __init__(self):
+        self.violations = []
+
+    def visit_For(self, node):
+        self.generic_visit(node)
+    
+    def visit_While(self, node):
+        self.generic_visit(node)
+
+    def visit_Call(self, node):
+        if isinstance(node.func, ast.Name) and node.func.id == 'range':
+            if len(node.args) == 1 and isinstance(node.args[0], ast.Constant):
+                if node.args[0].value > 100000:
+                    self.violations.append(f"Forbidden large range limit detected: {node.args[0].value}")
+        self.generic_visit(node)
+
+    @classmethod
+    def validate_code(cls, code_str: str) -> bool:
+        try:
+            tree = ast.parse(code_str)
+            validator = cls()
+            validator.visit(tree)
+            if validator.violations:
+                return False
+            return True
+        except Exception:
+            return False
+
+class SecureExecutionEngine:
+    @staticmethod
+    def execute_python_tir(code_string: str, timeout: int = 5) -> Tuple[str, bool]:
+        if not RedTeamASTValidator.validate_code(code_string):
+            return "AST_VIOLATION_BLOCKED", False
+
+        def limit_resources():
+            try:
+                resource.setrlimit(resource.RLIMIT_AS, (4 * 1024**3, 4 * 1024**3))
+            except Exception:
+                pass
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+            f.write("import sys\nsys.set_int_max_str_digits(0)\n" + code_string)
+            temp_name = f.name
+
+        try:
+            result = subprocess.run(
+                [sys.executable, temp_name],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                preexec_fn=limit_resources
+            )
+            if result.returncode == 0:
+                output = result.stdout.strip().splitlines()
+                if output:
+                    return output[-1], True
+            return result.stderr.strip(), False
+        except subprocess.TimeoutExpired:
+            return "TIMEOUT", False
+        except Exception as e:
+            return str(e), False
+        finally:
+            if os.path.exists(temp_name):
+                os.remove(temp_name)
+
+class AIMO3ApexEngineRTX6000:
+    def __init__(self, model_path: str):
+        self.model_path = model_path
+        self.llm = None
+        self.sampling_params = None
+        self._init_vllm()
+
+    def _init_vllm(self):
+        logger.info("[ENGINE] Initializing vLLM Inference Engine optimized for NVIDIA RTX 6000 (48GB VRAM)...")
+        from vllm import LLM, SamplingParams
+        self.llm = LLM(
+            model=self.model_path,
+            tensor_parallel_size=1,
+            gpu_memory_utilization=0.88,
+            enforce_eager=True,
+            max_model_len=8192
+        )
+        self.sampling_params = SamplingParams(
+            temperature=0.6,
+            top_p=0.95,
+            max_tokens=6000,
+            n=5
+        )
+
+    def extract_pure_integer(self, text: str) -> int:
+        boxed_matches = re.findall(r'\\boxed\{([^}]+)\}', text)
+        if boxed_matches:
+            clean_val = re.sub(r'[^0-9-]', '', boxed_matches[-1])
+            if clean_val:
+                try:
+                    return int(clean_val) % 100000
+                except ValueError:
+                    pass
+        
+        numbers = re.findall(r'\b\d+\b', text)
+        if numbers:
+            return int(numbers[-1]) % 100000
+        return 0
+
+    def verify_answer_with_judge(self, problem_text: str, candidate_answer: int) -> bool:
+        if not self.llm:
+            return True
+        prompt = f"Problem:\n{problem_text}\n\nProposed Answer: {candidate_answer}\nIs this answer mathematically correct? Answer with exactly one word: CORRECT or WRONG."
+        try:
+            outputs = self.llm.generate([prompt], self.sampling_params)
+            for output in outputs[0].outputs:
+                if "CORRECT" in output.text.upper():
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def solve_problem(self, problem_text: str) -> int:
+        gc.disable()
+        try:
+            prompt = IRONCLAD_SYSTEM_PROMPT + f"\n\n### PROBLEM STATEMENT:\n{problem_text}"
+            outputs = self.llm.generate([prompt], self.sampling_params)
+            
+            candidates = []
+            for output in outputs[0].outputs:
+                text = output.text
+                code_match = re.search(r'```python(.*?)```', text, re.DOTALL)
+                
+                exec_success = False
+                ans = 0
+                if code_match:
+                    code_str = code_match.group(1)
+                    res, success = SecureExecutionEngine.execute_python_tir(code_str)
+                    if success:
+                        try:
+                            ans = int(re.sub(r'[^0-9-]', '', res)) % 100000
+                            exec_success = True
+                        except ValueError:
+                            pass
+                    else:
+                        corrector_prompt = prompt + f"\n\nYour previous code failed with:\n{res}\nFix the code and output the correct final integer."
+                        corr_outputs = self.llm.generate([corrector_prompt], self.sampling_params)
+                        if corr_outputs and corr_outputs[0].outputs:
+                            corr_text = corr_outputs[0].outputs[0].text
+                            corr_match = re.search(r'```python(.*?)```', corr_text, re.DOTALL)
+                            if corr_match:
+                                res_corr, success_corr = SecureExecutionEngine.execute_python_tir(corr_match.group(1))
+                                if success_corr:
+                                    try:
+                                        ans = int(re.sub(r'[^0-9-]', '', res_corr)) % 100000
+                                        exec_success = True
+                                        text = corr_text
+                                    except ValueError:
+                                        pass
+                
+                if not exec_success:
+                    ans = self.extract_pure_integer(text)
+                
+                weight = 1.5 if exec_success else 0.5
+                candidates.append((ans, weight, text))
+
+            if not candidates:
+                return 0
+
+            vote_weights = defaultdict(float)
+            for ans, weight, _ in candidates:
+                vote_weights[ans] += weight
+
+            sorted_candidates = sorted(vote_weights.items(), key=lambda x: x[1], reverse=True)
+            top_answer = sorted_candidates[0][0]
+
+            if self.verify_answer_with_judge(problem_text, top_answer):
+                return top_answer
+            
+            return top_answer
+        finally:
+            gc.enable()
+            gc.collect()
+
+# ==============================================================================
+# TIER 3: EXECUTION GATEWAY & ORCHESTRATOR PIPELINE
+# ==============================================================================
+def run_pipeline():
+    logger.info("--- [GATEWAY] EXECUTING AIMO 3 RTX 6000 APEX PIPELINE ---")
+    
+    # Tier 1 Activation
+    env_ready = HybridTopologyAssembler.verify_and_repair_environment()
+    if not env_ready:
+        logger.error("[GATEWAY] Environment validation reported issues, but attempting resilient fallback execution...")
+
+    test_path = '/kaggle/input/ai-mathematical-olympiad-progress-prize-3/test.csv'
+    if not os.path.exists(test_path):
+        df = pd.DataFrame({'id': ['001'], 'problem': ['Calculate the number of positive integers n <= 1000 such that n^2 + n is divisible by 5.']})
+    else:
+        df = pd.read_csv(test_path)
+
+    model_dir = "/kaggle/input/models/qwen-lm/qwq-32b-preview/transformers/default/1"
+    if not os.path.exists(model_dir):
+        model_dir = "/kaggle/input/qwen-qwq-32b-preview"
+
+    try:
+        engine = AIMO3ApexEngineRTX6000(model_path=model_dir)
+    except Exception as e:
+        logger.critical(f"[GATEWAY] Engine initialization failed completely: {e}. Writing safe zero-filled fallback submission.")
+        fallback_df = pd.DataFrame({'id': df['id'], 'answer': [0] * len(df)})
+        fallback_df.to_csv('/kaggle/working/submission.csv', index=False)
+        return
+
+    results = []
+    total_problems = len(df)
+    for idx, row in df.iterrows():
+        prob_id = row['id']
+        problem_text = row['problem']
+        logger.info(f"[GATEWAY] Processing Problem [{idx + 1}/{total_problems}] ID: {prob_id}")
+        
+        try:
+            ans = engine.solve_problem(problem_text)
+        except Exception as e:
+            logger.error(f"[GATEWAY] Graceful fallback triggered on ID {prob_id} due to: {e}")
+            ans = 0
+            
+        results.append({'id': prob_id, 'answer': ans})
+
+    sub_df = pd.DataFrame(results)
+    sub_df.to_csv('/kaggle/working/submission.csv', index=False)
+    logger.info("--- [GATEWAY] SUBMISSION SUCCESSFULLY GENERATED AT /kaggle/working/submission.csv ---")
+
+if __name__ == "__main__":
+    run_pipeline()
