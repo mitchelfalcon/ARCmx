@@ -1,0 +1,79 @@
+Para configurar de forma óptima el entorno air-gapped en un notebook de Kaggle equipado con una GPU NVIDIA RTX 6000, es necesario empaquetar y estructurar las dependencias en formato de archivos binarios (.whl) clasificados por Tiers de instalación. Esta jerarquización permite que el orquestador agéntico y los módulos de aceleración por hardware se desplieguen sin requerir acceso a internet.
+Estructura de Niveles (Tiers) de Wheels para NVIDIA RTX 6000
+Tier 0: Núcleo de Computación y Aceleración CUDA (PyTorch & Runtime Core)
+Este nivel contiene los binenciales base de PyTorch compilados con soporte CUDA para la arquitectura Ada Lovelace / Hopper de la RTX 6000.
+ * torch: torch-2.4.0+cu121-cp310-cp310-linux_x86_64.whl (o versión compatible con Python 3.10)
+ * torchvision: torchvision-0.19.0+cu121-cp310-cp310-linux_x86_64.whl
+ * torchaudio: torchaudio-2.4.0+cu121-cp310-cp310-linux_x86_64.whl
+ * Librerías de Soporte NVIDIA CUDA Runtime (nvidia-*):
+   * nvidia_cublas_cu12 (nvidia_cublas_cu12-12.1.3.1-py3-none-manylinux1_x86_64.whl)
+   * nvidia_cuda_cupti_cu12 (nvidia_cuda_cupti_cu12-12.1.105-py3-none-manylinux1_x86_64.whl)
+   * nvidia_cuda_runtime_cu12 (nvidia_cuda_runtime_cu12-12.1.105-py3-none-manylinux1_x86_64.whl)
+   * nvidia_cudnn_cu12 (nvidia_cudnn_cu12-8.9.2.26-py3-none-manylinux1_x86_64.whl)
+   * nvidia_cufft_cu12 (nvidia_cufft_cu12-11.0.2.54-py3-none-manylinux1_x86_64.whl)
+   * nvidia_curand_cu12 (nvidia_curand_cu12-10.3.2.106-py3-none-manylinux1_x86_64.whl)
+   * nvidia_cusolver_cu12 (nvidia_cusolver_cu12-11.4.5.107-py3-none-manylinux1_x86_64.whl)
+   * nvidia_cusparse_cu12 (nvidia_cusparse_cu12-12.1.0.106-py3-none-manylinux1_x86_64.whl)
+   * nvidia_nccl_cu12 (nvidia_nccl_cu12-2.18.3-py3-none-manylinux1_x86_64.whl)
+Tier 1: Manipulación de Tensores, Modelos Locales y Estructuras Base
+Agrupa las dependencias lógicas y de procesamiento matricial necesarias para el bucle REPL ampliado de 8 GB y los modelos sintetizadores locales en VRAM.
+ * numpy: numpy-1.26.4-cp310-cp310-linux_x86_64.whl
+ * pydantic: pydantic-2.8.2-py3-none-any.whl
+ * pydantic_core: pydantic_core-2.20.1-cp310-cp310-linux_x86_64.whl
+ * typing_extensions: typing_extensions-4.12.2-py3-none-any.whl
+ * annotated-types: annotated_types-0.7.0-py3-none-any.whl
+Tier 2: Ecosistema Transformers y Aceleración de Inferencia en VRAM
+Incluye las bibliotecas requeridas para manejar modelos de lenguaje de gran tamaño (LLMs) sintetizadores de código de 14B a 32B parámetros directamente en la memoria de la RTX 6000.
+ * transformers: transformers-4.43.0-py3-none-any.whl
+ * tokenizers: tokenizers-0.19.1-cp310-cp310-linux_x86_64.whl
+ * huggingface-hub: huggingface_hub-0.24.0-py3-none-any.whl
+ * safetensors: safetensors-0.4.3-cp310-cp310-linux_x86_64.whl
+ * filelock: filelock-3.15.4-py3-none-any.whl
+ * fsspec: fsspec-2024.6.1-py3-none-any.whl
+ * pyyaml: PyYAML-6.0.1-cp310-cp310-linux_x86_64.whl
+ * requests: requests-2.32.3-py3-none-any.whl
+ * urllib3: urllib3-2.2.2-py3-none-any.whl
+ * certifi: certifi-2024.7.4-py3-none-any.whl
+ * charset-normalizer: charset_normalizer-3.3.2-cp310-cp310-linux_x86_64.whl
+ * idna: idna-3.7-py3-none-any.whl
+Guía de Instalación Automatizada por Tiers en el Notebook
+Para desplegar estos paquetes ordenadamente desde un dataset local montado en /kaggle/input/rtx6000-wheels-v1, puedes emplear el siguiente script de instalación secuencial por fases dentro de la primera celda del cuaderno:
+import subprocess
+import sys
+from pathlib import Path
+
+WHEELS_BASE = Path("/kaggle/input/rtx6000-wheels-v1")
+
+TIERS = [
+    "tier_0_cuda",
+    "tier_1_tensor",
+    "tier_2_transformers"
+]
+
+def install_offline_tiers():
+    for tier in TIERS:
+        tier_path = WHEELS_BASE / tier
+        if not tier_path.exists():
+            print(f"[ADVERTENCIA] El directorio {tier} no existe en el dataset montado.")
+            continue
+            
+        print(f"[INSTALANDO] Procesando paquetes del {tier.upper()}...")
+        cmd = [
+            sys.executable, "-m", "pip", "install",
+            "--no-index",
+            f"--find-links={tier_path}",
+            "--no-deps",
+            "--quiet",
+            *([str(w) for w in tier_path.glob("*.whl")])
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"[ERROR] Falló la instalación en {tier}: {result.stderr.strip()}")
+            raise RuntimeError(f"Error crítico instalando {tier}")
+        else:
+            print(f"[OK] {tier.upper()} instalado correctamente.")
+
+if __name__ == "__main__":
+    install_offline_tiers()
+
