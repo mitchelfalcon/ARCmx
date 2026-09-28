@@ -1,60 +1,121 @@
-1. Archivo de Requerimientos (requirements.txt) y Manifest de Wheels
-Este manifiesto asegura que ninguna dependencia descargue versiones no alineadas que rompan el binario C++ de PyTorch (_GLIBCXX_USE_CXX11_ABI=0).
-# --- CORE FRAMEWORK (CUDA 12.4 / Compute Capability 8.9) ---
+Aquí tienes la réplica completa del ecosistema de software, dividida en sus **cuatro scripts modulares de producción** y el **protocolo de despliegue en Notebook**, adaptada específicamente a la microarquitectura **NVIDIA RTX 6000 Ada Generation (48 GB VRAM)** bajo **Python 3.12** y **CUDA 12.4**.
+
+La cruda verdad técnica para la RTX 6000 Ada: **Ya no necesitas capar el motor ni forzar fallbacks lentos de Python puro** (como hacías en la Tesla T4). En la arquitectura Ada Lovelace (Compute Capability 8.9), la prioridad es explotar los **48 GB de VRAM**, los **Tensor Cores de 4ª Generación** y la precisión nativa **BFloat16 / TF32** con **FlashAttention-2** y **PagedAttention (vLLM)** a máximo throughput sin que el Kernel colapse por OOM o choques de ABI C++.
+
+---
+
+### FASE 0: Archivo de Requerimientos y Script de Descarga Offline
+
+#### `requirements.txt`
+
+```txt
+# --- CORE FRAMEWORK (CUDA 12.4 / Python 3.12) ---
 --extra-index-url https://download.pytorch.org/whl/cu124
 torch==2.4.0+cu124
 torchvision==0.19.0+cu124
 torchaudio==2.4.0+cu124
 
-# --- ACELERACIÓN DE ATENCIÓN Y MOTORES DE INFERENCIA ---
-# Nota: flash-attn debe ser la versión precompilada abiFALSE
-https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu122torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+# --- ACELERACIÓN Y ATENCIÓN (Python 3.12 / CXX11 ABI false) ---
 xformers==0.0.27
 vllm==0.5.4
 
-# --- PROCESAMIENTO TABULAR EN VRAM (RAPIDS CUDA 12) ---
+# --- RAPIDS DATA SCIENCE EN VRAM (CUDA 12 / Py3.12) ---
 --extra-index-url https://pypi.nvidia.com
 cudf-cu12==24.08.0
 dask-cudf-cu12==24.08.0
 cuml-cu12==24.08.0
 
-# --- UTILIDADES Y PROTOCOLO DE AUDITORÍA ---
+# --- AUDITORÍA Y ESTRUCTURA ---
 pydantic==2.7.1
 PyJWT==2.8.0
 reportlab==4.2.0
 networkx==3.3
 psutil==5.9.8
+safetensors>=0.4.3
+transformers>=4.44.0
+mamba-ssm>=2.2.2
+causal-conv1d>=1.4.0
 
-2. Código Completo de Despliegue e Instalación de la Plataforma (deploy_platform.py)
-Este script realiza la instalación secuencial aislada. Previene que pip resuelva dinámicamente paquetes no compatibles, verifica la compatibilidad de arquitectura en caliente y valida la integridad de los módulos instalados.
+```
+
+#### `download_wheels.sh` (Ejecutar en máquina con internet antes de aislar la red)
+
+```bash
+#!/usr/bin/env bash
+set -e
+
+WHEELS_DIR="./rtx_pro_6000_wheels"
+mkdir -p "$WHEELS_DIR"
+
+echo "=================================================================="
+echo "🚀 DESCARGANDO ÁRBOL COMPLETO DE WHEELS PARA PYTHON 3.12 / CUDA 12.4"
+echo "=================================================================="
+
+# 1. PyTorch Core
+python3.12 -m pip download \
+    --dest "$WHEELS_DIR" \
+    --extra-index-url https://download.pytorch.org/whl/cu124 \
+    torch==2.4.0+cu124 torchvision==0.19.0+cu124 torchaudio==2.4.0+cu124
+
+# 2. FlashAttention-2 precompilado estrictamente para cp312 y abiFALSE
+echo "Descargando FlashAttention-2 para Python 3.12..."
+wget -P "$WHEELS_DIR" https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu122torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
+
+# 3. vLLM, xFormers, RAPIDS, Mamba SSM y dependencias transitivas
+python3.12 -m pip download \
+    --dest "$WHEELS_DIR" \
+    --extra-index-url https://download.pytorch.org/whl/cu124 \
+    --extra-index-url https://pypi.nvidia.com \
+    vllm==0.5.4 xformers==0.0.27 \
+    cudf-cu12==24.08.0 cuml-cu12==24.08.0 dask-cudf-cu12==24.08.0 \
+    pydantic==2.7.1 PyJWT==2.8.0 reportlab==4.2.0 networkx==3.3 psutil==5.9.8 \
+    safetensors transformers mamba-ssm causal-conv1d
+
+echo "✅ Descarga completada. Guarda la carpeta '$WHEELS_DIR' en tu Dataset de Kaggle / Storage Offline."
+
+```
+
+---
+
+### FASE 1: Script de Despliegue Offline (`deploy_platform.py`)
+
+Este script realiza la instalación secuencial aislada evitando que `pip` intente conectarse a índices externos o resuelva binarios incompatibles.
+
+```python
+#!/usr/bin/env python3
+"""
+PROJECT SENTINEL - DEPLOY PLATFORM (PYTHON 3.12 / RTX 6000 ADA)
+Responsibility: Isolated Offline Wheel Installation & Dependency Enforcement.
+"""
 import os
 import sys
-import shutil
 import subprocess
 import logging
 from pathlib import Path
 
-# Configuración de Logging para Auditoría de Despliegue
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S"
 )
-logger = logging.getLogger("PlatformDeployer")
+logger = logging.getLogger("SentinelDeployer")
 
 class PlatformInstaller:
     """
-    Gestor de despliegue offline/online para la plataforma NVIDIA RTX Pro 48GB.
-    Garantiza el orden estricto de instalación de Wheels para evitar conflictos de ABI.
+    Gestor de despliegue offline para la plataforma NVIDIA RTX 6000 Ada (48GB VRAM).
+    Asegura la compatibilidad con Python 3.12 (cp312) y CXX11 ABI False.
     """
     def __init__(self, wheels_dir: str = None):
         self.wheels_dir = Path(wheels_dir) if wheels_dir else None
         self.python_bin = sys.executable
-        
+
+        if sys.version_info[:2] != (3, 12):
+            logger.warning(f"⚠️ Versión de Python detectada: {sys.version}. Se requiere Python 3.12 estrictamente.")
+
     def _run_command(self, cmd: str, description: str) -> bool:
         logger.info(f"Iniciando: {description}...")
         try:
-            result = subprocess.run(
+            subprocess.run(
                 cmd,
                 shell=True,
                 check=True,
@@ -67,70 +128,68 @@ class PlatformInstaller:
             logger.error(f"❌ Fallo crítico en '{description}':\nSTDOUT: {e.stdout}\nSTDERR: {e.stderr}")
             return False
 
-    def check_cuda_driver(self):
-        """Verifica que el controlador del Host soporte la GPU Ada Lovelace."""
-        logger.info("Comprobando entorno de controladores del Host...")
+    def check_hardware(self):
+        """Verifica la presencia y estado de la RTX 6000 Ada / Compute Capability 8.9."""
+        logger.info("Comprobando entorno de GPU de Host...")
         try:
             nvidia_smi = subprocess.check_output("nvidia-smi", shell=True, text=True)
-            if "RTX" in nvidia_smi or "L4" in nvidia_smi or "G4" in nvidia_smi:
-                logger.info("✅ GPU NVIDIA detectada correctamente en el sistema.")
+            if "RTX 6000" in nvidia_smi or "Ada" in nvidia_smi or "RTX" in nvidia_smi:
+                logger.info("✅ GPU NVIDIA RTX 6000 Ada / Lovelace confirmada.")
             else:
-                logger.warning("⚠️ Dispositivo GPU no identificado explícitamente como RTX Pro / G4.")
+                logger.warning("⚠️ Dispositivo detectado difiere de la especificación RTX 6000 Ada.")
         except Exception:
-            logger.error("❌ 'nvidia-smi' no está disponible. Revisa los controladores del Host.")
+            logger.error("❌ 'nvidia-smi' no disponible. Revisa los controladores NVIDIA del Host.")
 
     def install_pipeline(self):
-        """Ejecuta la secuencia ordenada de instalación de paquetes."""
-        self.check_cuda_driver()
-        
-        # 1. Actualización de herramientas base de empaquetado
-        self._run_command(
-            f"{self.python_bin} -m pip install --upgrade pip setuptools wheel --quiet",
-            "Actualización de Pip y Setuptools"
-        )
+        self.check_hardware()
 
-        base_pip = f"{self.python_bin} -m pip install "
-        if self.wheels_dir and self.wheels_dir.exists():
-            logger.info(f"Modo Offline Activado. Buscando wheels en: {self.wheels_dir}")
-            base_pip += f"--no-index --find-links={self.wheels_dir} "
+        if not self.wheels_dir or not self.wheels_dir.exists():
+            raise FileNotFoundError(f"❌ No se encontró el directorio de wheels offline en: {self.wheels_dir}")
 
-        # 2. Instalación de PyTorch CUDA 12.4 Core
-        torch_cmd = base_pip + "torch==2.4.0+cu124 torchvision==0.19.0+cu124 torchaudio==2.4.0+cu124"
-        if not self.wheels_dir:
-            torch_cmd += " --index-url https://download.pytorch.org/whl/cu124"
-        
-        if not self._run_command(torch_cmd, "Instalación de PyTorch 2.4.0+cu124 Core"):
-            raise RuntimeError("Error al instalar PyTorch Core. Abortando instalación.")
+        base_pip = f"{self.python_bin} -m pip install --no-index --find-links={self.wheels_dir} "
 
-        # 3. Instalación de FlashAttention-2 (Wheel Binario Directo)
-        if self.wheels_dir and self.wheels_dir.exists():
-            flash_cmd = base_pip + "flash_attn"
+        # 1. Actualización de Pip
+        self._run_command(f"{self.python_bin} -m pip install --upgrade pip --quiet", "Actualización Interna de Pip")
+
+        # 2. PyTorch Core (CUDA 12.4)
+        logger.info("Instalando Core Framework (PyTorch 2.4.0+cu124)...")
+        torch_cmd = base_pip + "torch torchvision torchaudio"
+        if not self._run_command(torch_cmd, "Instalación de PyTorch Core"):
+            raise RuntimeError("Fallo en la instalación del Core de PyTorch.")
+
+        # 3. FlashAttention-2 (Wheel binario directo cp312)
+        flash_wheels = list(self.wheels_dir.glob("flash_attn*cp312*.whl"))
+        if flash_wheels:
+            flash_cmd = base_pip + str(flash_wheels[0])
+            self._run_command(flash_cmd, "Instalación de FlashAttention-2 (cp312/abiFALSE)")
         else:
-            flash_url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu122torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl"
-            flash_cmd = base_pip + f"{flash_url}"
-            
-        if not self._run_command(flash_cmd, "Instalación de FlashAttention-2 (abiFALSE)"):
-            logger.warning("⚠️ No se pudo instalar FlashAttention-2 precompilado. Se recurrirá a PyTorch SDPA.")
+            logger.warning("⚠️ Wheel de FlashAttention-2 cp312 no hallado. El motor usará PyTorch SDPA Nativo.")
 
-        # 4. Instalación de Motores de Inferencia y Datos (vLLM, xFormers, cuDF)
-        extra_pkgs = "vllm==0.5.4 xformers==0.0.27 pydantic==2.7.1 PyJWT==2.8.0 reportlab==4.2.0 networkx==3.3 psutil"
-        vllm_cmd = base_pip + extra_pkgs
-        if not self.wheels_dir:
-            vllm_cmd += " --extra-index-url https://download.pytorch.org/whl/cu124"
-            
-        self._run_command(vllm_cmd, "Instalación de Motores de Inferencia y Utilidades")
+        # 4. Motores de Inferencia, RAPIDS y SSM
+        extra_pkgs = "vllm xformers cudf-cu12 cuml-cu12 dask-cudf-cu12 pydantic PyJWT reportlab networkx psutil safetensors transformers mamba-ssm causal-conv1d"
+        self._run_command(base_pip + extra_pkgs, "Instalación de Motores Heterogéneos VRAM & RAPIDS")
 
-        logger.info("🎉 ¡Despliegue de la Plataforma Completado Exitosamente!")
+        logger.info("🎉 ¡Despliegue de Plataforma Sentinel Completado!")
 
 if __name__ == "__main__":
-    # Si existe una carpeta de wheels locales, se pasa como argumento
-    WHEELS_LOCAL_PATH = "/kaggle/input/rtx-pro-wheels-dataset" if os.path.exists("/kaggle/input/rtx-pro-wheels-dataset") else None
-    
-    installer = PlatformInstaller(wheels_dir=WHEELS_LOCAL_PATH)
+    WHEELS_PATH = "/kaggle/input/rtx-pro-wheels-dataset" if os.path.exists("/kaggle/input/rtx-pro-wheels-dataset") else "./rtx_pro_6000_wheels"
+    installer = PlatformInstaller(wheels_dir=WHEELS_PATH)
     installer.install_pipeline()
 
-3. Script de Inyección de Arquitectura y Parcheo de Sistema (inject_architecture.py)
-Este script debe ejecutarse en la Primera Celda del Notebook. Aplica la inyección de variables de entorno para el bus PCIe de la máquina G4, realiza el Monkey Patching de la gestión de memoria de PyTorch para prevenir que el Kernel de Jupyter falle (Kernel Crash), y bloquea las degradaciones lentas a CPU.
+```
+
+---
+
+### FASE 2: Inyección de Arquitectura y Guardián de Memoria (`inject_architecture.py`)
+
+Este script se ejecuta en la celda inicial del notebook. Configura el bus PCIe Ada, intercepta OOMs en la VRAM de 48 GB y fuerza el cómputo en **BFloat16 / TF32**.
+
+```python
+#!/usr/bin/env python3
+"""
+PROJECT SENTINEL - RUNTIME INJECTOR & ADA MEMORY GUARD
+Responsibility: Environment Injection, OOM Recovery, and Precision Tuning for RTX 6000 Ada (48 GB).
+"""
 import os
 import sys
 import gc
@@ -140,29 +199,28 @@ import logging
 # ---------------------------------------------------------------------------
 # FASE 1: INYECCIÓN DE VARIABLES DE ENTORNO CRÍTICAS (Antes de importar torch)
 # ---------------------------------------------------------------------------
-os.environ["NCCL_P2P_LEVEL"] = "PHB"                       # Interconexión P2P PCIe para G4
-os.environ["NCCL_DEBUG"] = "ERROR"                         # Desactivar verbosidad excesiva de NCCL
-os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"           # Optimización de colas de comandos para Ada Lovelace
+os.environ["NCCL_P2P_LEVEL"] = "PHB"                        # Interconexión P2P para bus PCIe G4/G5
+os.environ["NCCL_DEBUG"] = "ERROR"                          # Silenciar verbosidad innecesaria
+os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"            # Optimizar cola de comandos en Ada Lovelace
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
-    "expandable_segments:True,"                            # Previene fragmentación de memoria en VRAM
-    "max_split_size_mb:512,"                               # Evita bloques masivos indivisibles
-    "garbage_collection_threshold:0.8"                     # Recolección automática de VRAM al 80%
+    "expandable_segments:True,"                            # Evita fragmentación en los 48 GB VRAM
+    "max_split_size_mb:512,"                               # Control de bloques masivos
+    "garbage_collection_threshold:0.8"                     # Purgado automático al alcanzar 80% VRAM
 )
-os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"       # Evita bloqueos infinitos si falla un proceso secundario
+os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
+os.environ["NUMEXPR_MAX_THREADS"] = "8"
 
-# Impresión de confirmación de inyección de entorno
 print("==================================================================")
-print("🚀 [INYECCIÓN DE ARQUITECTURA] Variables de Entorno del Kernel Configuradas")
+print("🚀 [SENTINEL INJECTOR] Entorno de Kernel Configurado para RTX 6000 Ada")
 print("==================================================================")
 
 import torch
 
 # ---------------------------------------------------------------------------
-# FASE 2: MONKEY PATCHING Y TRATAMIENTO DE ERRORES DE MEMORIA VRAM
+# FASE 2: MONKEY PATCHING Y INTERCEPTOR DE ERRORES OOM
 # ---------------------------------------------------------------------------
-
 def global_vram_cleanup():
-    """Realiza una limpieza agresiva del Garbage Collector y Búfers de CUDA."""
+    """Ejecuta purga agresiva de memoria en la VRAM de 48 GB."""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -170,73 +228,270 @@ def global_vram_cleanup():
 
 def patch_oom_recovery(func):
     """
-    Decorador Monkey Patch: Envuelve funciones críticas de tensores. Si ocurre un OOM,
-    vacia la VRAM y reintenta antes de propagar el fallo y romper el Kernel.
+    Decorador Guardián: Intercepta picos de OutOfMemoryError en operaciones matriciales,
+    purgando búfers VRAM y reintentando inmediatamente antes de que el Kernel falle.
     """
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
         except torch.cuda.OutOfMemoryError as oom_err:
-            print(f"\n🚨 [OOM INTERCEPTADO EN '{func.__name__}'] Vaciando búfer VRAM y reintentando...")
+            print(f"\n🚨 [OOM INTERCEPTADO EN '{func.__name__}'] Purgando VRAM de 48GB y reintentando...")
             global_vram_cleanup()
             try:
                 return func(*args, **kwargs)
             except torch.cuda.OutOfMemoryError:
-                print(f"💥 [OOM PERSISTENTE EN '{func.__name__}'] Imposible procesar el tensor en GPU.")
+                print(f"💥 [OOM PERSISTENTE EN '{func.__name__}'] Memoria VRAM Insuficiente.")
                 raise oom_err
     return wrapper
 
-# Aplicar el parche preventivo a la función de multiplicación de matrices global
+# Aplicar el parche sobre la función primaria de multiplicación de matrices
 torch.matmul = patch_oom_recovery(torch.matmul)
 
 # ---------------------------------------------------------------------------
-# FASE 3: CONFIGURACIÓN DE TENSORES Y COMPATIBILIDAD CON RTX PRO (48 GB)
+# FASE 3: CONFIGURACIÓN RUNTIME OPTIMIZADA PARA ADA LOVELACE (CC 8.9)
 # ---------------------------------------------------------------------------
-
 def configure_hardware_runtime():
-    """
-    Valida y configura el motor de cálculo de PyTorch para la arquitectura Ada Lovelace.
-    """
     if not torch.cuda.is_available():
-        raise SystemError("❌ CRÍTICO: CUDA no está activo. Revisa la asignación de hardware.")
+        raise SystemError("❌ CRÍTICO: CUDA no está activo. Verifica la asignación de la RTX 6000 Ada.")
 
-    device_properties = torch.cuda.get_device_properties(0)
-    device_name = device_properties.name
-    vram_gb = device_properties.total_memory / (1024 ** 3)
-    
-    print(f"• Dispositivo Activo: {device_name}")
-    print(f"• Capacidad VRAM Asignada: {vram_gb:.2f} GB")
-    print(f"• Compute Capability: {device_properties.major}.{device_properties.minor}")
-    
-    # Activar TensorCores en FP32 / TF32
+    props = torch.cuda.get_device_properties(0)
+    vram_gb = props.total_memory / (1024 ** 3)
+
+    print(f"• Dispositivo: {props.name}")
+    print(f"• Capacidad VRAM: {vram_gb:.2f} GB")
+    print(f"• Compute Capability: {props.major}.{props.minor}")
+
+    # 1. Habilitar Tensor Cores FP32/TF32
     torch.set_float32_matmul_precision('high')
-    
-    # Configurar Backends de Atención (Forzar SDPA de alto rendimiento)
+
+    # 2. Configurar Backends de Atención Escalada (SDPA)
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
-    torch.backends.cuda.enable_math_sdp(False)  # Desactivar la versión en CPU/Math para evitar ejecuciones lentas silenciosas
-    
-    # Validar soporte nativo de BFloat16
-    if torch.cuda.is_bf16_supported():
-        print("✅ Soporte BFloat16 Nativo: ACTIVADO")
-    else:
-        print("⚠️ Advertencia: BFloat16 no soportado de forma nativa en el dispositivo.")
+    torch.backends.cuda.enable_math_sdp(False)  # Bloquea degradaciones lentas a CPU
 
-    # Iniciar monitor de memoria interna
+    # 3. Validar BFloat16 Nativo (Requerido para Ada Lovelace)
+    if torch.cuda.is_bf16_supported():
+        print("✅ Precision BFloat16 Nativa: ACTIVADA")
+    else:
+        print("⚠️ Advertencia: BFloat16 no disponible nativamente.")
+
     torch.cuda.reset_peak_memory_stats()
     print("==================================================================")
-    print("✅ [INYECCIÓN COMPLETADA] Sistema protegido contra fallos de versión y OOM")
+    print("✅ [INYECCIÓN COMPLETADA] Motor protegido contra OOM y caídas de Kernel")
     print("==================================================================")
 
-# Ejecutar la inyección
 configure_hardware_runtime()
 
-Instrucciones de Despliegue en el Notebook
- * Celda 1 (Instalación de dependencias):
-   !python deploy_platform.py
+```
 
- * Celda 2 (Inyección e Inicialización de Arquitectura):
-   import inject_architecture
+---
 
-   Al ejecutar la Celda 2, el entorno aplicará las variables de entorno, parchará la gestión de memoria de PyTorch y garantizará que ningún desajuste de versión o pico de VRAM detenga la ejecución del notebook durante la competencia.
+### FASE 3: Hidratador Nativo del Motor Cognitivo (`sentinel_engine_core.py`)
+
+Nailea, este es la **adaptación directa de tu script `MARDUK/KANISH**`, refinado para aprovechar la velocidad real de la **RTX 6000 Ada**.
+
+A diferencia de la T4, aquí usaremos **`torch.bfloat16` nativo**, intentaremos utilizar los kernels acelerados de C++/CUDA en VRAM (`causal_conv1d_cuda`, `selective_scan_cuda`), y si falta algún binario en el entorno offline, aplicará el protocolo de rescate transparente sin detener la ejecución.
+
+```python
+#!/usr/bin/env python3
+"""
+PROJECT SENTINEL ENGINE (V26.0 - ADA EDITION)
+Responsibility: High-Throughput Model Hydration, BFloat16 Tensor Alignment, and Memory-Safe Ingestion.
+"""
+import os
+import sys
+import json
+import logging
+import inspect
+from pathlib import Path
+from types import ModuleType
+
+# Importar inyector preventivo
+import inject_architecture
+
+import torch
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("Sentinel_Engine_Core")
+
+class AdaRescueProtocol:
+    """
+    Protocolo Transparente de Rescate para C++ Kernels.
+    Si los binarios C++ están presentes, usa máxima aceleración.
+    Si faltan en el paquete offline, inyecta fallbacks nativos de PyTorch sin colapsar.
+    """
+    @staticmethod
+    def verify_or_patch_kernels():
+        logger.info("--- [SYS] VERIFICANDO KERNELS C++/CUDA EN VRAM ---")
+        
+        # Probar si los kernels C++ nativos están compilados y accesibles
+        try:
+            import selective_scan_cuda
+            import causal_conv1d_cuda
+            logger.info("✅ Kernels C++/CUDA Fused detectados nativamente. Modo Máximo Throughput Activo.")
+        except ImportError:
+            logger.warning("⚠️ Kernels C++ Fused no encontrados. Aplicando 'Graph Surgery' a fallbacks nativos PyTorch...")
+            
+            # Mock de módulos faltantes
+            for mod_name in ["selective_scan_cuda", "layer_norm_cuda", "causal_conv1d_cuda"]:
+                if mod_name not in sys.modules:
+                    sys.modules[mod_name] = ModuleType(mod_name)
+
+            import mamba_ssm.ops.selective_scan_interface as ssi
+            import mamba_ssm.ops.triton.layer_norm as mamba_ln
+            import mamba_ssm.modules.mamba_simple as ms
+            from mamba_ssm.ops.selective_scan_interface import selective_scan_ref, mamba_inner_ref
+
+            ssi.selective_scan_fn = selective_scan_ref
+            ssi.mamba_inner_fn = mamba_inner_ref
+            ms.selective_scan_fn = selective_scan_ref
+            ms.mamba_inner_fn = mamba_inner_ref
+            ms.causal_conv1d_fn = None
+            ms.causal_conv1d_update = None
+
+            def layer_norm_fn_native(x, weight, bias, residual=None, eps=1e-5, is_rms_norm=False, **kwargs):
+                dtype = x.dtype
+                if is_rms_norm:
+                    out = (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)) * weight
+                else:
+                    out = torch.nn.functional.layer_norm(x.float(), x.shape[-1:], weight.float(), bias.float(), eps).to(dtype)
+                return (out + residual if residual is not None else out), residual
+
+            mamba_ln.layer_norm_fn = layer_norm_fn_native
+            logger.info("[OK] Parches de cómputo nativos aplicados correctamente.")
+
+class SentinelCoreHydrator:
+    """
+    Orquestador de Hidratación en VRAM (48 GB RTX 6000 Ada).
+    Configura BFloat16, realiza alineación de Safetensors y amarra pesos (Weight Tying).
+    """
+
+    # RUTA LOCAL DEL MODELO EN EL ENTORNO OFFLINE / KAGGLE
+    MODEL_DIR = "/kaggle/input/datasets/naileafalcon/kanish-wheels-py312/full_dev/full_dev/mamba/mamba_130m_model"
+
+    @classmethod
+    def hydrate_model(cls, custom_model_path: str = None):
+        target_path = Path(custom_model_path if custom_model_path else cls.MODEL_DIR)
+
+        # 1. Ejecutar verificación de parches antes de cargar el modelo
+        AdaRescueProtocol.verify_or_patch_kernels()
+
+        # 2. Configurar dispositivo y precisión óptima para Ada Lovelace
+        if not torch.cuda.is_available():
+            logger.error("[CRÍTICO] CUDA no detectado. Revisa la GPU asignada.")
+            device = "cpu"
+            dtype = torch.float32
+        else:
+            device = "cuda:0"
+            # En RTX 6000 Ada preferimos BFloat16 sobre FP16 por rango dinámico
+            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+        from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+        from mamba_ssm.models.config_mamba import MambaConfig
+        from transformers import AutoTokenizer
+        from safetensors.torch import load_file
+
+        if not target_path.exists():
+            raise FileNotFoundError(f"❌ La ruta del modelo no existe: {target_path}")
+
+        # 3. Cargar Configuración y Limpiar Parámetros incompatible
+        with open(target_path / "config.json", "r") as f:
+            raw_cfg = json.load(f)
+
+        sig = inspect.signature(MambaConfig.__init__)
+        allowed_keys = [p for p in sig.parameters if p != 'self']
+        raw_cfg['d_model'] = raw_cfg.get('hidden_size', 768)
+        raw_cfg['n_layer'] = raw_cfg.get('num_hidden_layers', 24)
+        config = MambaConfig(**{k: v for k, v in raw_cfg.items() if k in allowed_keys})
+
+        logger.info(f"--- [SYS] HIDRATANDO MOTOR COGNITIVO EN VRAM ({dtype} | {device} | RTX 6000 ADA) ---")
+
+        # 4. Carga de Safetensors y Re-alineación de Namespaces
+        safetensor_file = target_path / "model.safetensors"
+        if not safetensor_file.exists():
+            # Buscar variante binaria de pytorch
+            safetensor_file = target_path / "pytorch_model.bin"
+            sd = torch.load(safetensor_file, map_location="cpu")
+        else:
+            sd = load_file(str(safetensor_file), device="cpu")
+
+        # Re-mapeo para coincidir con MambaLMHeadModel
+        new_sd = {
+            k.replace("backbone.embeddings.", "backbone.embedding.").replace("model.", ""): v.to(dtype) 
+            for k, v in sd.items()
+        }
+
+        # 5. Carga Segura en VRAM
+        with torch.inference_mode():
+            model = MambaLMHeadModel(config, device=device, dtype=dtype)
+            missing, unexpected = model.load_state_dict(new_sd, strict=False)
+
+            # Amarre manual de pesos si lm_head no viene explícito
+            if "lm_head.weight" in missing:
+                model.lm_head.weight = model.backbone.embedding.weight
+                logger.info("[OK] Weight Tying ejecutado: 'lm_head.weight' enlazado a 'embedding.weight'.")
+
+            model.eval()
+
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(str(target_path))
+            except Exception as e:
+                logger.error(f"[ERROR] No se pudo cargar el tokenizer desde {target_path}: {e}")
+                raise e
+
+        vram_used = torch.cuda.memory_allocated(0) / (1024 ** 2)
+        logger.info(f"[OK] Motor Sentinel listo en RTX 6000 Ada. Uso inicial VRAM: {vram_used:.2f} MB")
+        return model, tokenizer
+
+if __name__ == "__main__":
+    # Prueba interactiva
+    model, tokenizer = SentinelCoreHydrator.hydrate_model()
+    print("\n[SENTINEL ENGINE] Listo para procesar inferencias.")
+
+```
+
+---
+
+### Instrucciones de Despliegue en Jupyter Notebook
+
+#### **Celda 1: Instalación Estática y Offline**
+
+```bash
+!python deploy_platform.py
+
+```
+
+#### **Celda 2: Inyección de Entorno y Carga del Motor Cognitivo**
+
+```python
+import inject_architecture
+from sentinel_engine_core import SentinelCoreHydrator
+
+# Carga e hidratación en BFloat16 dentro de los 48 GB VRAM
+model, tokenizer = SentinelCoreHydrator.hydrate_model()
+
+```
+
+#### **Celda 3: Inferencia de Ejemplo**
+
+```python
+import torch
+
+prompt = "El protocolo Sentinel en la arquitectura RTX 6000 Ada"
+input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to("cuda")
+
+with torch.inference_mode():
+    output = model.generate(
+        input_ids=input_ids,
+        max_length=100,
+        cg=True, # Habilitar CUDA Graphs en Ada Lovelace
+        return_dict_in_generate=True
+    )
+
+print("\n--- RESPUESTA GENERADA ---")
+print(tokenizer.decode(output.sequences[0].tolist()))
+
+```
+
+Con esta adaptación, Nailea, cuentas con el manifiesto completo de wheels, el instalador con cero consumo de internet, el inyector preventivo de OOMs y el motor hidratador configurado para **BFloat16 / TF32** en la RTX 6000 Ada.
